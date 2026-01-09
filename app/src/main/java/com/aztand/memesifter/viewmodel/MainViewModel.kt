@@ -14,6 +14,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -32,20 +36,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiEvent = Channel<String>()
     val uiEvent = _uiEvent.receiveAsFlow()
     fun scanImages() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.Default) { // 使用 Default 调度器处理 CPU 密集型任务
             val allRawImages = imageRepository.getAllImages()
 
-            // ✅ 移除 .take(50)，对所有图片进行遍历
-            allRawImages.forEach { item ->
-                // 为了避免瞬间把 UI 线程卡死或内存爆掉，
-                // 可以在这里加一点点延时，或者依靠协程的调度自动处理
-                // 对于几千张图，目前的逐个 processImage 是安全的
-                processImage(item)
+            // 优化 1：分批并发处理
+            // 将所有图片分成每组 10 张（可根据性能调整，例如 20）
+            val batchSize = 10
+            allRawImages.chunked(batchSize).forEach { batch ->
+
+                // 并发执行当前批次的 OCR
+                val deferredResults = batch.map { item ->
+                    async(Dispatchers.IO) {
+                        val text = ocrRepository.recognizeText(item.uri)
+                        if (text.isNotBlank()) {
+                            item.copy(ocrText = text)
+                        } else {
+                            null
+                        }
+                    }
+                }
+
+                // 等待这一批全部完成
+                val validMemesInBatch = deferredResults.awaitAll().filterNotNull()
+
+                // 优化 2：批量更新 UI，减少重组次数
+                if (validMemesInBatch.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        val currentList = _images.value.toMutableList()
+                        currentList.addAll(validMemesInBatch)
+                        _images.value = currentList
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                _uiEvent.send("扫描完成！共找到 ${_images.value.size} 张图片")
             }
         }
     }
 
-    private suspend fun processImage(item: ImageItem) {
+    /*private suspend fun processImage(item: ImageItem) {
         // 调用 OCR 识别
         val text = ocrRepository.recognizeText(item.uri)
 
@@ -62,6 +92,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // 我们不再自动勾选，把选择权完全交给用户
         }
     }
+    已被整合至scanimages
+    */
 
     // 手动切换选中状态
     fun toggleSelection(id: Long) {
@@ -83,24 +115,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun moveSelectedImages() {
         viewModelScope.launch {
+            // 获取当前选中的图片对象
             val selectedItems = _images.value.filter { selectedIds.contains(it.id) }
             if (selectedItems.isEmpty()) return@launch
 
+            // 执行移动逻辑，如果需要权限，这里会返回 intentSender
             val intentSender = fileRepository.moveImagesToMemeFolder(selectedItems)
 
             if (intentSender == null) {
-                // 成功！
-                val count = selectedIds.size
+                // 全部移动成功（或者不需要额外权限的部分已移动）
 
-                // 2. 优化：直接从当前列表中移除已移动的图片，而不是重新扫描 (更流畅)
+                // 重新检查哪些文件还在原处（意味着移动失败或者还在等权限）
+                // 简单的做法是：再次扫描数据库状态，或者根据逻辑移除已移动的
+                // 这里我们做一个简化的假设：如果返回 null，说明没有 Pending 的权限请求了
+                // 但实际上可能只移动了一部分。
+
+                // 为了保证 UI 准确，建议：
+                // 1. 移除那些已经成功移动到 Memes 文件夹的图片
+                // (由于我们无法从 moveImagesToMemeFolder 得到确切的成功列表，
+                // 最稳妥的方法是依靠 ImageRepository 重新检查，或者在 Repository 里返回成功列表)
+
+                // 简单优化：从列表中移除选中的 ID，提示用户操作完成
+                // 如果有部分没移走，下次扫描会再出来，或者用户会发现它们还在。
+
                 _images.value = _images.value.filter { !selectedIds.contains(it.id) }
-
-                // 3. 清空选中状态
+                val count = selectedIds.size
                 selectedIds.clear()
-
-                // 4. 发送提示消息
-                _uiEvent.send("成功归档 $count 张Meme图！")
+                _uiEvent.send("操作结束，已处理 $count 张图片")
             } else {
+                // 需要用户授权，触发弹窗
                 _permissionRequest.value = intentSender
             }
         }
