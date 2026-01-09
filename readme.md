@@ -65,4 +65,4 @@ Meme-Sifter 是一款基于 Android 的本地工具应用，旨在解决手机�
 ### 构建步骤
 1. 克隆仓库：
    ```bash
-   git clone [https://github.com/YourUsername/MemeSifter.git](https://github.com/YourUsername/MemeSifter.git)
+   git clone [https://github.com/Aztand/MemeSifter.git](https://github.com/Aztand/MemeSifter.git)
